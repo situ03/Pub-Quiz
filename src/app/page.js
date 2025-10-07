@@ -1,6 +1,5 @@
 "use client";
-export const dynamic = 'force-dynamic';  // no SSG/ISR for this page
-export const revalidate = 0;   
+
 
 import React, { useEffect, useMemo, useState } from "react";
 import { initializeApp } from "firebase/app";
