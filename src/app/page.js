@@ -628,7 +628,7 @@ function PlayerView({ roomCode, player }) {
       {quiz.state === "break" && (
         <Card className="text-center p-10">
           <h3 className="text-2xl font-semibold">Break time 🧃</h3>
-          <p className="text-muted-foreground">Stretch your legs. Back soon!</p>
+          <p className="text-muted-foreground">Stretch your legs. Back soon! Perks gotta pesh</p>
         </Card>
       )}
 
@@ -715,7 +715,7 @@ export default function PubQuizApp() {
       <div className="mx-auto max-w-5xl grid gap-4">
         <header className="flex items-center justify-between">
           <h1 className="text-2xl md:text-3xl font-bold tracking-tight">🍻 Pub Quiz</h1>
-          <div className="text-sm text-muted-foreground">Live, simple, and free</div>
+          <div className="text-sm text-muted-foreground">yaaay omg so fuuuun</div>
         </header>
         <Separator />
 
