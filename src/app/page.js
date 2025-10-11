@@ -1,6 +1,5 @@
 "use client";
 
-
 import React, { useEffect, useMemo, useState } from "react";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getDatabase, ref, set, onValue, get, update, push } from "firebase/database";
@@ -17,10 +16,10 @@ import {
   Download, Play, Square, Users, ChevronRight, ChevronLeft,
   Sparkles, PauseCircle, TimerReset, Clock3
 } from "lucide-react";
+
 /* =========================
-   Firebase (correct config)
+   Firebase (client-safe)
    ========================= */
-// Firebase (env-based, client-safe)
 const FIREBASE_CONFIG = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
   authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
@@ -36,18 +35,15 @@ const FIREBASE_CONFIG = {
 };
 
 const app = getApps().length ? getApp() : initializeApp(FIREBASE_CONFIG);
-
-// Anna URL eksplisiittisesti, niin SDK ei “arvaa”
 const DB_URL =
   process.env.NEXT_PUBLIC_FIREBASE_DATABASE_URL ||
   (process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID
     ? `https://${process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}-default-rtdb.europe-west1.firebasedatabase.app`
     : undefined);
-
 export const db = getDatabase(app, DB_URL);
 
 /* ==============
-   Small helpers
+   Helpers
    ============== */
 const makeRoomCode = () => Math.random().toString(36).slice(2, 7).toUpperCase();
 const clean = (s) => (s || "").trim();
@@ -55,10 +51,10 @@ const toCSV = (rows) =>
   rows.map(r => r.map(c => `"${String(c ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
 
 /* -----------------------------------------
-   Server clock hook (fixes clock drift)
+   Server clock hook (fixes client clock drift)
    ----------------------------------------- */
 function useServerClock() {
-  const [offset, setOffset] = useState(0); // ms
+  const [offset, setOffset] = useState(0);
   useEffect(() => {
     const offRef = ref(db, ".info/serverTimeOffset");
     return onValue(offRef, snap => setOffset(snap.val() || 0));
@@ -131,12 +127,13 @@ function useTick(ms = 250) {
 /* ======================
    Quiz data operations
    ====================== */
-async function createRoom({ title, questions }) {
+async function createRoom({ title }) {
   const code = makeRoomCode();
   const baseRef = ref(db, `rooms/${code}`);
   const quiz = {
     title: clean(title) || "Pub Quiz",
-    questions: questions || [],
+    questions: [],                 // public questions (no answers)
+    revealedAnswers: {},           // index -> answer AFTER reveal
     currentIndex: -1,
     state: "lobby",
     defaultTimerSec: 60,
@@ -148,7 +145,6 @@ async function createRoom({ title, questions }) {
   return code;
 }
 
-// nowFn defaults to local now but Host will pass serverNow()
 async function setTimer(roomCode, seconds, nowFn = () => Date.now()) {
   const ends = nowFn() + seconds * 1000;
   await update(ref(db, `rooms/${roomCode}/quiz`), { timerEndsAt: ends, accepting: true });
@@ -157,24 +153,35 @@ async function stopTimer(roomCode) {
   await update(ref(db, `rooms/${roomCode}/quiz`), { accepting: false });
 }
 
-// break after every CHUNK questions (10 by default)
-const CHUNK = 10;
+const CHUNK = 10; // break after every 10 Qs
 
 async function advance(roomCode, dir = 1, nowFn = () => Date.now()) {
   const quizRef = ref(db, `rooms/${roomCode}/quiz`);
   const snap = await get(quizRef);
   if (!snap.exists()) return;
 
-  const quiz  = snap.val();
+  const quiz = snap.val();
   const total = quiz.questions?.length || 0;
   let nextIndex = quiz.currentIndex + dir;
 
-  const startQuestion = (index) => update(quizRef, {
-    currentIndex: index,
-    state: "question",
-    accepting: true,
-    timerEndsAt: nowFn() + (quiz.defaultTimerSec || 60) * 1000,
-  });
+  // reveal the current Q before moving forward
+  const revealCurrentIfAny = async () => {
+    if (quiz.currentIndex >= 0 && quiz.currentIndex < total) {
+      const ansSnap = await get(ref(db, `rooms/${roomCode}/hostAnswers/${quiz.currentIndex}`));
+      const correct = ansSnap.val();
+      if (correct !== undefined && correct !== null) {
+        await update(quizRef, { [`revealedAnswers/${quiz.currentIndex}`]: correct });
+      }
+    }
+  };
+
+  const startQuestion = (index) =>
+    update(quizRef, {
+      currentIndex: index,
+      state: "question",
+      accepting: true,
+      timerEndsAt: nowFn() + (quiz.defaultTimerSec || 60) * 1000,
+    });
 
   // Lobby → first question
   if (quiz.state === "lobby") {
@@ -186,12 +193,14 @@ async function advance(roomCode, dir = 1, nowFn = () => Date.now()) {
   // While showing a question
   if (quiz.state === "question") {
     if (dir > 0) {
+      await revealCurrentIfAny();
+
       // finished?
       if (nextIndex >= total) {
         await update(quizRef, { currentIndex: total - 1, state: "results", accepting: false, timerEndsAt: 0 });
         return;
       }
-      // break after every CHUNK questions (10, 20, 30, …), but not after the last one
+      // break after every CHUNK (10, 20, …), not if it's the last one
       if (nextIndex > 0 && nextIndex % CHUNK === 0 && nextIndex < total) {
         await update(quizRef, { currentIndex: nextIndex, state: "break", accepting: false, timerEndsAt: 0 });
         return;
@@ -199,12 +208,11 @@ async function advance(roomCode, dir = 1, nowFn = () => Date.now()) {
       await startQuestion(nextIndex);
       return;
     } else {
-      // going backwards
+      // going backwards (no reveal on back)
       if (nextIndex < 0) {
         await update(quizRef, { currentIndex: -1, state: "lobby", accepting: false, timerEndsAt: 0 });
         return;
       }
-      // stepping back into a break boundary (…, 9, 19, 29, …)
       if ((nextIndex + 1) % CHUNK === 0) {
         await update(quizRef, { currentIndex: nextIndex, state: "break", accepting: false, timerEndsAt: 0 });
         return;
@@ -217,11 +225,9 @@ async function advance(roomCode, dir = 1, nowFn = () => Date.now()) {
   // On a break screen
   if (quiz.state === "break") {
     if (dir > 0) {
-      // resume with the first question of the next block (we stored the boundary index)
-      await startQuestion(quiz.currentIndex);
+      await startQuestion(quiz.currentIndex);       // resume next block
     } else {
-      // go back to the last question of the previous block
-      await startQuestion(quiz.currentIndex - 1);
+      await startQuestion(quiz.currentIndex - 1);   // back one
     }
     return;
   }
@@ -232,33 +238,39 @@ async function advance(roomCode, dir = 1, nowFn = () => Date.now()) {
   }
 }
 
-
 async function submitAnswer(roomCode, qIndex, player, answer, accepting) {
-  if (!accepting) return; // hard block if time is up
+  if (!accepting) return; // time up -> ignore
   const aRef = ref(db, `rooms/${roomCode}/answers/${qIndex}`);
   const entry = { name: clean(player.name), id: player.id, answer, ts: Date.now() };
   await push(aRef, entry);
 }
 
 /* ======================
-   Scoring utilities
+   Scoring utilities (use revealedAnswers)
    ====================== */
 function calcScores(quiz, allAnswers) {
   const players = new Map();
   const questions = quiz?.questions || [];
+  const revealed = quiz?.revealedAnswers || {};
+
   Object.entries(allAnswers || {}).forEach(([qIdxStr, rows]) => {
     const qIdx = Number(qIdxStr);
     const q = questions[qIdx];
-    const correct = q?.correctAnswer;
-    const normCorrect = q?.type === "mc" ? String(correct) : clean(String(correct || "").toLowerCase());
+    const correct = revealed[qIdx];
+    const hasCorrect = correct !== undefined && correct !== null;
+
     Object.values(rows).forEach((r) => {
       const key = r.id + "::" + r.name;
       if (!players.has(key)) players.set(key, { name: r.name, id: r.id, score: 0, answers: {} });
       const p = players.get(key); p.answers[qIdx] = r.answer;
+
+      if (!hasCorrect) return;
+
       if (q?.type === "mc") {
-        if (String(r.answer) === normCorrect) p.score += 1;
+        if (String(r.answer) === String(correct)) p.score += 1;
       } else if (q?.type === "text") {
-        if (clean(String(r.answer || "").toLowerCase()) === normCorrect) p.score += 1;
+        const norm = (x) => clean(String(x || "").toLowerCase());
+        if (norm(r.answer) === norm(correct)) p.score += 1;
       }
     });
   });
@@ -272,7 +284,7 @@ function ExportCSVButton({ roomCode, quiz }) {
   const all = useAllAnswers(roomCode);
   const csv = useMemo(() => {
     const rows = [];
-    const header = ["Player", "Score", ...((quiz?.questions || []).map((q, i) => `Q${i + 1}`))];
+    const header = ["Player", "Score", ...((quiz?.questions || []).map((_, i) => `Q${i + 1}`))];
     const scores = calcScores(quiz, all);
     rows.push(header);
     scores.forEach(s =>
@@ -416,63 +428,65 @@ function HostView({ roomCode, quiz }) {
           )}
 
           {quiz?.state === "results" && (
-  <div className="grid gap-6">
-    <div className="flex items-center gap-2">
-      <Sparkles className="h-5 w-5" />
-      <h3 className="text-xl font-semibold">Results</h3>
-    </div>
+            <div className="grid gap-6">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-5 w-5" />
+                <h3 className="text-xl font-semibold">Results</h3>
+              </div>
 
-    <div className="overflow-x-auto">
-      <table className="min-w-full text-sm">
-        <thead>
-          <tr className="border-b text-left">
-            <th className="py-2 pr-3">Player</th>
-            <th className="py-2 pr-3">Score</th>
-            {quiz?.questions?.map((_, i) => (
-              <th key={i} className="py-2 px-2">Q{i + 1}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {scores.map((s, i) => (
-  <tr key={i} className="border-b">
-    <td className="py-2 pr-3 font-medium">{s.name}</td>
-    <td className="py-2 pr-3">{s.score}</td>
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="border-b text-left">
+                      <th className="py-2 pr-3">Player</th>
+                      <th className="py-2 pr-3">Score</th>
+                      {quiz?.questions?.map((_, i) => (
+                        <th key={i} className="py-2 px-2">Q{i + 1}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scores.map((s, i) => (
+                      <tr key={i} className="border-b">
+                        <td className="py-2 pr-3 font-medium">{s.name}</td>
+                        <td className="py-2 pr-3">{s.score}</td>
 
-    {quiz?.questions?.map((q, qi) => {
-      const ans = s.answers?.[qi];
-      const isCorrect =
-        q.type === "mc"
-          ? Number(ans) === q.correctAnswer
-          : String(ans ?? "").trim().toLowerCase() ===
-            String(q.correctAnswer ?? "").trim().toLowerCase();
+                        {quiz?.questions?.map((q, qi) => {
+                          const ans = s.answers?.[qi];
+                          const correct = quiz?.revealedAnswers?.[qi];
+                          const isCorrect =
+                            correct == null ? false :
+                            q.type === "mc"
+                              ? Number(ans) === Number(correct)
+                              : String(ans ?? "").trim().toLowerCase() ===
+                                String(correct ?? "").trim().toLowerCase();
 
-      return (
-        <td
-          key={qi}
-          className={`py-2 px-2 whitespace-nowrap ${
-            isCorrect ? "text-green-600 font-medium" : ""
-          }`}
-        >
-          {q.type === "mc"
-            ? ans != null
-              ? `Option ${String.fromCharCode(65 + Number(ans))}`
-              : "—"
-            : ans ?? "—"}
-        </td>
-      );
-    })}
-  </tr>
-))}
-
-        </tbody>
-      </table>
-    </div>
-  </div>
-)}
+                          return (
+                            <td
+                              key={qi}
+                              className={`py-2 px-2 whitespace-nowrap ${
+                                isCorrect ? "text-green-600 font-medium" : ""
+                              }`}
+                            >
+                              {q.type === "mc"
+                                ? ans != null
+                                  ? `Option ${String.fromCharCode(65 + Number(ans))}`
+                                  : "—"
+                                : ans ?? "—"}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
+      {/* QUESTIONS CARD (secure loaders) */}
       <Card>
         <CardHeader><CardTitle>Questions</CardTitle></CardHeader>
         <CardContent className="grid gap-4">
@@ -481,6 +495,8 @@ function HostView({ roomCode, quiz }) {
               <TabsTrigger value="paste">Paste JSON</TabsTrigger>
               <TabsTrigger value="builder">Quick Builder</TabsTrigger>
             </TabsList>
+
+            {/* Paste JSON */}
             <TabsContent value="paste" className="grid gap-3">
               <Textarea id="qs" className="min-h-[220px] font-mono" defaultValue={SAMPLE_QUESTIONS_JSON} />
               <div className="flex gap-2">
@@ -488,15 +504,38 @@ function HostView({ roomCode, quiz }) {
                   const el = document.getElementById("qs");
                   try {
                     const parsed = JSON.parse(el.value);
+
+                    // public data only (no answers)
+                    const publicQuestions = parsed.map(({ type, prompt, choices }) => ({
+                      type, prompt, choices: choices || []
+                    }));
+                    // host-only answers
+                    const correctAnswers = parsed.map(q => q.correctAnswer);
+
                     await update(ref(db, `rooms/${roomCode}/quiz`), {
-                      questions: parsed, currentIndex: -1, state: "lobby", accepting: false, timerEndsAt: 0
+                      questions: publicQuestions,
+                      currentIndex: -1,
+                      state: "lobby",
+                      accepting: false,
+                      timerEndsAt: 0,
+                      revealedAnswers: {}
                     });
+
+                    await set(ref(db, `rooms/${roomCode}/hostAnswers`), correctAnswers);
+
                     alert("Questions loaded! Start when ready.");
-                  } catch (e) { alert("Invalid JSON: " + e.message); }
+                  } catch (e) {
+                    alert("Invalid JSON: " + e.message);
+                  }
                 }}>Load Questions</Button>
-                <Button variant="outline" onClick={() => navigator.clipboard.writeText(SAMPLE_QUESTIONS_JSON)}>Copy Sample</Button>
+
+                <Button variant="outline" onClick={() => navigator.clipboard.writeText(SAMPLE_QUESTIONS_JSON)}>
+                  Copy Sample
+                </Button>
               </div>
             </TabsContent>
+
+            {/* Quick Builder */}
             <TabsContent value="builder">
               <QuickBuilder roomCode={roomCode} />
             </TabsContent>
@@ -507,9 +546,10 @@ function HostView({ roomCode, quiz }) {
   );
 }
 
+/* ------------ QUICK BUILDER (secure save) ------------ */
 function QuickBuilder({ roomCode }) {
   const [prompt, setPrompt] = useState("");
-  const [type, setType] = useState("mc");
+  const [type, setType] = useState("mc"); // "mc" | "text"
   const [choices, setChoices] = useState(["", "", "", ""]);
   const [correctAnswer, setCorrectAnswer] = useState(0);
   const [built, setBuilt] = useState([]);
@@ -555,11 +595,28 @@ function QuickBuilder({ roomCode }) {
           setBuilt(b => [...b, q]);
           setPrompt(""); setChoices(["", "", "", ""]); setCorrectAnswer(type === "mc" ? 0 : "");
         }}>Add Question</Button>
+
         <Button variant="outline" onClick={() => setBuilt([])}>Clear</Button>
+
         <Button variant="secondary" onClick={async () => {
+          // public data only
+          const publicQuestions = built.map(({ type, prompt, choices }) => ({
+            type, prompt, choices: choices || []
+          }));
+          // host-only answers
+          const correctAnswers = built.map(q => q.correctAnswer);
+
           await update(ref(db, `rooms/${roomCode}/quiz`), {
-            questions: built, currentIndex: -1, state: "lobby", accepting: false, timerEndsAt: 0
+            questions: publicQuestions,
+            currentIndex: -1,
+            state: "lobby",
+            accepting: false,
+            timerEndsAt: 0,
+            revealedAnswers: {}
           });
+
+          await set(ref(db, `rooms/${roomCode}/hostAnswers`), correctAnswers);
+
           alert(`Loaded ${built.length} question(s)!`);
         }}>Load to Room</Button>
       </div>
@@ -628,7 +685,7 @@ function PlayerView({ roomCode, player }) {
       {quiz.state === "break" && (
         <Card className="text-center p-10">
           <h3 className="text-2xl font-semibold">Break time 🧃</h3>
-          <p className="text-muted-foreground">Stretch your legs. Back soon! Perks gotta pesh</p>
+          <p className="text-muted-foreground">Stretch your legs. Back soon!</p>
         </Card>
       )}
 
@@ -678,7 +735,6 @@ function PlayerView({ roomCode, player }) {
   );
 }
 
-
 /* =========================
    Root app component
    ========================= */
@@ -693,7 +749,7 @@ export default function PubQuizApp() {
 
   const startRoom = async () => {
     try {
-      const code = await createRoom({ title: hostTitle, questions: [] });
+      const code = await createRoom({ title: hostTitle });
       setRoomCode(code);
       setMode("host");
     } catch (e) {
