@@ -685,7 +685,7 @@ function PlayerView({ roomCode, player }) {
       {quiz.state === "break" && (
         <Card className="text-center p-10">
           <h3 className="text-2xl font-semibold">Break time 🧃</h3>
-          <p className="text-muted-foreground">Stretch your legs. Back soon!</p>
+          <p className="text-muted-foreground">Get a new drink. Perks gotta pesh brb</p>
         </Card>
       )}
 
